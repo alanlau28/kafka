@@ -83,13 +83,13 @@ import static org.junit.jupiter.api.Assertions.fail;
  */
 @Tag("integration")
 @Timeout(360)
-public class RuntimeChaosTaskMigratedIntegrationTest {
+public class RuntimeChaosCombinedSoakIntegrationTest {
 
     private static final String STORE_NAME = "chaos-windowed-counts";
     private static final String[] KEYS = {"a", "b", "c"};
     private static final long WINDOW_MS = 200L;
     private static final long RETENTION_MS = 600_000L; // >> test duration, so no window expires before the IQ check
-    private static final long CHAOS_DURATION_MS = 45_000L;
+    private static final long CHAOS_DURATION_MS = 90_000L;
     private static final long PRODUCE_INTERVAL_MS = 25L;
     private static final double FAULT_PROBABILITY = 0.30;
 
@@ -110,7 +110,7 @@ public class RuntimeChaosTaskMigratedIntegrationTest {
         cluster = new EmbeddedKafkaCluster(1);
         cluster.start();
         final String base = safeUniqueTestName(info);
-        appId = "chaos-migrated-" + base;
+        appId = "chaos-combined-" + base;
         inputTopic = appId + "-in";
         cluster.createTopic(inputTopic, 2, 1); // 2 partitions -> 2 tasks, more lifecycle churn surface
         proxy = KafkaProtocolFaultProxy.inFrontOf(cluster.bootstrapServers());
@@ -143,15 +143,23 @@ public class RuntimeChaosTaskMigratedIntegrationTest {
     }
 
     @Test
-    public void shouldStayExactlyOnceUnderRuntimeMigrationStorm() throws Exception {
+    public void shouldStayExactlyOnceUnderCombinedRuntimeChaos() throws Exception {
         startApp();
         startProducer();
 
-        // Arm the runtime lever and let the app churn while continuously processing. NO restart.
-        final FaultRule fence =
-            proxy.injectError(ApiKeys.END_TXN, Errors.PRODUCER_FENCED).withProbability(FAULT_PROBABILITY);
-        final LogCaptureAppender logs =
-            LogCaptureAppender.createAndRegister();
+        // Combined runtime chaos: several faults armed at once, all withProbability, so rare interleavings can
+        // occur (a corruption landing mid-migration, a commit gap during a revive, a produce retry across a
+        // rebalance). Tuned so the app still makes progress and can drain when cleared. NO restart.
+        final FaultRule restoreOor = proxy.injectError(ApiKeys.FETCH, Errors.OFFSET_OUT_OF_RANGE)
+            .forClient("restore").withProbability(0.5);
+        final FaultRule fence = proxy.injectError(ApiKeys.END_TXN, Errors.PRODUCER_FENCED)
+            .withProbability(0.2);
+        final FaultRule epoch = proxy.injectError(ApiKeys.END_TXN, Errors.INVALID_PRODUCER_EPOCH)
+            .withProbability(0.1);
+        final FaultRule commitGap = proxy.disconnectOn(ApiKeys.END_TXN).withProbability(0.05);
+        final FaultRule produceRetry = proxy.injectError(ApiKeys.PRODUCE, Errors.NOT_ENOUGH_REPLICAS)
+            .withProbability(0.1);
+        final LogCaptureAppender logs = LogCaptureAppender.createAndRegister();
         Thread.sleep(CHAOS_DURATION_MS);
 
         // Stop the storm and the producer, then let the app fully drain and quiesce.
@@ -159,38 +167,40 @@ public class RuntimeChaosTaskMigratedIntegrationTest {
         producing.set(false);
         producerThread.join(Duration.ofSeconds(10).toMillis());
 
-        final long migrationLogs = logs.getMessages().stream().filter(m -> {
+        final long churnLogs = logs.getMessages().stream().filter(m -> {
             final String l = m.toLowerCase(Locale.ROOT);
-            return l.contains("migrated") || l.contains("fenced") || l.contains("detected that the thread");
+            return l.contains("corrupt") || l.contains("wiped") || l.contains("reviv")
+                || l.contains("migrated") || l.contains("fenced");
         }).count();
         logs.close();
 
+        final long fired = restoreOor.timesTriggered() + fence.timesTriggered() + epoch.timesTriggered()
+            + commitGap.timesTriggered() + produceRetry.timesTriggered();
         final long total = produced.get();
         // Oracle 2: exactly-once. Poll the store (via IQ) until the summed window counts reach the produced
         // total, or time out. Under exactly-once this converges to EXACTLY total; > total => duplication.
         final long summed = waitForStoreSum(total);
 
-        System.out.println("CHAOS-STATS fired=" + fence.timesTriggered() + " migrationLogs=" + migrationLogs
+        System.out.println("CHAOS-STATS fired=" + fired + " (oor=" + restoreOor.timesTriggered() + " fence="
+            + fence.timesTriggered() + " epoch=" + epoch.timesTriggered() + " commitGap="
+            + commitGap.timesTriggered() + " produce=" + produceRetry.timesTriggered() + ") churnLogs=" + churnLogs
             + " produced=" + total + " summed=" + summed);
 
-        // Churn sanity: the storm must have actually injected fences AND caused real migrations, otherwise a
-        // clean pass would be hollow.
-        assertTrue(fence.timesTriggered() > 0,
-            "the fault storm never fired (fired=" + fence.timesTriggered() + ")");
-        assertTrue(migrationLogs > 0,
-            "no migration/fence churn observed in logs (count=" + migrationLogs + ")");
+        // Churn sanity: the combined storm must have fired AND churned lifecycle, else the pass is hollow.
+        assertTrue(fired > 0, "the combined storm never fired (fired=" + fired + ")");
+        assertTrue(churnLogs > 0, "no corruption/migration churn observed in logs (count=" + churnLogs + ")");
 
         // Oracle 1: no fatal from a recoverable churn.
         final Throwable fatal = uncaught.get();
         if (fatal != null) {
             final String chain = throwableChain(fatal).toLowerCase(Locale.ROOT);
             if (chain.contains("committedoffset") || (chain.contains("closed") && chain.contains("segment"))) {
-                fail("KAFKA-20808-class regression under migration storm:\n" + throwableChain(fatal));
+                fail("KAFKA-20808-class regression under combined chaos:\n" + throwableChain(fatal));
             }
-            fail("runtime migration storm surfaced a fatal exception:\n" + throwableChain(fatal));
+            fail("combined runtime chaos surfaced a fatal exception:\n" + throwableChain(fatal));
         }
         assertEquals(total, summed,
-            "exactly-once violated under runtime migration storm: produced=" + total + " but store summed=" + summed);
+            "exactly-once violated under combined runtime chaos: produced=" + total + " but store summed=" + summed);
         assertEquals(KafkaStreams.State.RUNNING, streams.state(), "app should be RUNNING after the storm");
     }
 

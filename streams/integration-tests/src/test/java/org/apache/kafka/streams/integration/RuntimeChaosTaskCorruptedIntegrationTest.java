@@ -83,7 +83,7 @@ import static org.junit.jupiter.api.Assertions.fail;
  */
 @Tag("integration")
 @Timeout(360)
-public class RuntimeChaosTaskMigratedIntegrationTest {
+public class RuntimeChaosTaskCorruptedIntegrationTest {
 
     private static final String STORE_NAME = "chaos-windowed-counts";
     private static final String[] KEYS = {"a", "b", "c"};
@@ -110,7 +110,7 @@ public class RuntimeChaosTaskMigratedIntegrationTest {
         cluster = new EmbeddedKafkaCluster(1);
         cluster.start();
         final String base = safeUniqueTestName(info);
-        appId = "chaos-migrated-" + base;
+        appId = "chaos-corrupted-" + base;
         inputTopic = appId + "-in";
         cluster.createTopic(inputTopic, 2, 1); // 2 partitions -> 2 tasks, more lifecycle churn surface
         proxy = KafkaProtocolFaultProxy.inFrontOf(cluster.bootstrapServers());
@@ -143,15 +143,21 @@ public class RuntimeChaosTaskMigratedIntegrationTest {
     }
 
     @Test
-    public void shouldStayExactlyOnceUnderRuntimeMigrationStorm() throws Exception {
+    public void shouldStayExactlyOnceUnderRuntimeCorruptionStorm() throws Exception {
         startApp();
         startProducer();
 
-        // Arm the runtime lever and let the app churn while continuously processing. NO restart.
-        final FaultRule fence =
-            proxy.injectError(ApiKeys.END_TXN, Errors.PRODUCER_FENCED).withProbability(FAULT_PROBABILITY);
-        final LogCaptureAppender logs =
-            LogCaptureAppender.createAndRegister();
+        // Runtime lever: restore-consumer OFFSET_OUT_OF_RANGE -> TaskCorrupted -> closeDirtyAndRevive on the
+        // SAME live segmented store objects (the KAFKA-20808 class). Restore only happens after a
+        // corruption/rebalance, so we PAIR it with an intermittent PRODUCER_FENCED (-> TaskMigrated ->
+        // restore), which keeps triggering restores that the OOR then corrupts. Both withProbability so the
+        // app still makes progress and can drain once faults are cleared. NO restart.
+        final FaultRule restoreOor = proxy.injectError(ApiKeys.FETCH, Errors.OFFSET_OUT_OF_RANGE)
+            .forClient("restore")
+            .withProbability(0.5);
+        final FaultRule fence = proxy.injectError(ApiKeys.END_TXN, Errors.PRODUCER_FENCED)
+            .withProbability(0.2);
+        final LogCaptureAppender logs = LogCaptureAppender.createAndRegister();
         Thread.sleep(CHAOS_DURATION_MS);
 
         // Stop the storm and the producer, then let the app fully drain and quiesce.
@@ -159,9 +165,9 @@ public class RuntimeChaosTaskMigratedIntegrationTest {
         producing.set(false);
         producerThread.join(Duration.ofSeconds(10).toMillis());
 
-        final long migrationLogs = logs.getMessages().stream().filter(m -> {
+        final long corruptLogs = logs.getMessages().stream().filter(m -> {
             final String l = m.toLowerCase(Locale.ROOT);
-            return l.contains("migrated") || l.contains("fenced") || l.contains("detected that the thread");
+            return l.contains("corrupt") || l.contains("wiped") || l.contains("reviv");
         }).count();
         logs.close();
 
@@ -170,27 +176,26 @@ public class RuntimeChaosTaskMigratedIntegrationTest {
         // total, or time out. Under exactly-once this converges to EXACTLY total; > total => duplication.
         final long summed = waitForStoreSum(total);
 
-        System.out.println("CHAOS-STATS fired=" + fence.timesTriggered() + " migrationLogs=" + migrationLogs
-            + " produced=" + total + " summed=" + summed);
+        System.out.println("CHAOS-STATS restoreOorFired=" + restoreOor.timesTriggered() + " fenceFired="
+            + fence.timesTriggered() + " corruptLogs=" + corruptLogs + " produced=" + total + " summed=" + summed);
 
-        // Churn sanity: the storm must have actually injected fences AND caused real migrations, otherwise a
-        // clean pass would be hollow.
-        assertTrue(fence.timesTriggered() > 0,
-            "the fault storm never fired (fired=" + fence.timesTriggered() + ")");
-        assertTrue(migrationLogs > 0,
-            "no migration/fence churn observed in logs (count=" + migrationLogs + ")");
+        // Churn sanity: the storm must have actually corrupted+revived tasks, else a clean pass is hollow.
+        assertTrue(restoreOor.timesTriggered() > 0,
+            "the restore-OOR storm never fired (fired=" + restoreOor.timesTriggered() + ")");
+        assertTrue(corruptLogs > 0,
+            "no TaskCorrupted/wipe/revive churn observed in logs (count=" + corruptLogs + ")");
 
         // Oracle 1: no fatal from a recoverable churn.
         final Throwable fatal = uncaught.get();
         if (fatal != null) {
             final String chain = throwableChain(fatal).toLowerCase(Locale.ROOT);
             if (chain.contains("committedoffset") || (chain.contains("closed") && chain.contains("segment"))) {
-                fail("KAFKA-20808-class regression under migration storm:\n" + throwableChain(fatal));
+                fail("KAFKA-20808-class regression under corruption storm:\n" + throwableChain(fatal));
             }
-            fail("runtime migration storm surfaced a fatal exception:\n" + throwableChain(fatal));
+            fail("runtime corruption storm surfaced a fatal exception:\n" + throwableChain(fatal));
         }
         assertEquals(total, summed,
-            "exactly-once violated under runtime migration storm: produced=" + total + " but store summed=" + summed);
+            "exactly-once violated under runtime corruption storm: produced=" + total + " but store summed=" + summed);
         assertEquals(KafkaStreams.State.RUNNING, streams.state(), "app should be RUNNING after the storm");
     }
 

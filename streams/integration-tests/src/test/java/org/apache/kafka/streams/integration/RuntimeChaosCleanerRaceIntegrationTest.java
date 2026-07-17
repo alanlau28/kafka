@@ -37,12 +37,10 @@ import org.apache.kafka.streams.integration.utils.KafkaProtocolFaultProxy;
 import org.apache.kafka.streams.kstream.Consumed;
 import org.apache.kafka.streams.kstream.Grouped;
 import org.apache.kafka.streams.kstream.Materialized;
-import org.apache.kafka.streams.kstream.TimeWindows;
 import org.apache.kafka.streams.state.KeyValueIterator;
 import org.apache.kafka.streams.state.QueryableStoreTypes;
-import org.apache.kafka.streams.state.ReadOnlyWindowStore;
+import org.apache.kafka.streams.state.ReadOnlyKeyValueStore;
 import org.apache.kafka.streams.state.Stores;
-import org.apache.kafka.streams.state.WindowBytesStoreSupplier;
 import org.apache.kafka.test.TestUtils;
 
 import org.junit.jupiter.api.AfterEach;
@@ -54,6 +52,7 @@ import org.junit.jupiter.api.Timeout;
 
 import java.time.Duration;
 import java.util.Locale;
+import java.util.Optional;
 import java.util.Properties;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
@@ -65,39 +64,45 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
 /**
- * RUNTIME chaos harness — bug HUNT (not a regression guard). A single EOS Streams app stays up for the whole
- * test; faults are injected LIVE via the wire proxy to churn task lifecycle (no {@code close()}/restart). The
- * goal is to surface NEW defects of the escaped-defect class (KIP-1035 offset management × task/store
- * lifecycle) — e.g. a fatal from a recoverable condition, or silent exactly-once loss/duplication.
+ * RUNTIME chaos harness for the state-directory cleaner race (KAFKA-20805 family).
  *
- * <p>This reference lever: intermittent {@code PRODUCER_FENCED} on {@code END_TXN} ({@code withProbability})
- * → {@code TaskMigratedException} → {@code closeDirty} + re-init on the SAME live store objects, repeatedly,
- * while processing continues. Other levers (restore-OOR TaskCorrupted storm, cleaner race, combined soak)
- * follow this same scaffold in sibling classes.
+ * <p>KIP-1035 moved changelog offsets from the per-task {@code .checkpoint} child file into an "offsets"
+ * RocksDB column family inside the task's RocksDB directory, so the task dir mtime no longer advances on
+ * every commit the way the checkpoint rewrite used to. The background
+ * {@link org.apache.kafka.streams.processor.internals.StateDirectory} cleaner deletes a task dir when
+ * {@code now - cleanupDelayMs > dir.lastModified()} provided the dir is not locked by a local thread.
  *
- * <p>Store under test: a persistent WINDOWED (segmented) store — the RocksDB-segment family the escaped
- * defects lived in. Oracle (checked after the storm, once the app quiesces): (1) no fatal surfaced to the
- * uncaught handler — in particular none with the KAFKA-20808 committedOffset-on-closed-segment signature;
- * (2) EXACTLY-ONCE — the sum of all window counts (read via IQ from the store itself) equals the number of
- * records produced, i.e. no record lost or double-counted across the churn; (3) liveness — RUNNING at the end.
+ * <p>To genuinely ORPHAN a task dir (so the eager cleaner deletes it, then the task migrates back and must
+ * re-init / re-restore -- the KIP-1035 offsets-column-family risk) this test runs TWO single-thread
+ * {@link KafkaStreams} instances in the same group. Shedding a thread from instance B moves its task to
+ * instance A with no local re-owner on B, so B's dir goes unlocked and the eager cleaner deletes it; adding
+ * the thread back forces the task to re-init on a wiped dir.
+ *
+ * <p>Oracles after the storm: (1) no fatal to the uncaught handler -- especially none with the KAFKA-20808
+ * committedOffset-on-closed-segment signature; (2) exactly-once -- summed per-key counts (via IQ across both
+ * instances) == records produced; (3) liveness. Non-hollow bar: the cleaner must actually have deleted a dir
+ * AND migrations must have churned.
  */
 @Tag("integration")
-@Timeout(360)
-public class RuntimeChaosTaskMigratedIntegrationTest {
+@Timeout(420)
+public class RuntimeChaosCleanerRaceIntegrationTest {
 
-    private static final String STORE_NAME = "chaos-windowed-counts";
-    private static final String[] KEYS = {"a", "b", "c"};
-    private static final long WINDOW_MS = 200L;
-    private static final long RETENTION_MS = 600_000L; // >> test duration, so no window expires before the IQ check
-    private static final long CHAOS_DURATION_MS = 45_000L;
+    private static final String STORE_NAME = "chaos-kv-counts";
+    private static final String[] KEYS = {"a", "b", "c", "d", "e", "f"};
     private static final long PRODUCE_INTERVAL_MS = 25L;
-    private static final double FAULT_PROBABILITY = 0.30;
+    private static final double FENCE_PROBABILITY = 0.30;
+    private static final double DISCONNECT_PROBABILITY = 0.15;
+    private static final long CLEANUP_DELAY_MS = 1_000L;
+    private static final int CHURN_CYCLES = 8;
+    private static final long SHED_WINDOW_MS = 8_000L; // orphan window: comfortably exceeds a cleaner scan interval
+    private static final long SETTLE_MS = 3_000L;      // dwell after re-adding the thread before the next shed
 
     private EmbeddedKafkaCluster cluster;
     private KafkaProtocolFaultProxy proxy;
     private String inputTopic;
     private String appId;
-    private KafkaStreams streams;
+    private KafkaStreams streamsA;
+    private KafkaStreams streamsB;
     private KafkaProducer<String, String> producer;
 
     private final AtomicReference<Throwable> uncaught = new AtomicReference<>();
@@ -110,9 +115,9 @@ public class RuntimeChaosTaskMigratedIntegrationTest {
         cluster = new EmbeddedKafkaCluster(1);
         cluster.start();
         final String base = safeUniqueTestName(info);
-        appId = "chaos-migrated-" + base;
+        appId = "chaos-cleaner-" + base;
         inputTopic = appId + "-in";
-        cluster.createTopic(inputTopic, 2, 1); // 2 partitions -> 2 tasks, more lifecycle churn surface
+        cluster.createTopic(inputTopic, 6, 1); // 6 tasks to shuffle across two single-thread instances
         proxy = KafkaProtocolFaultProxy.inFrontOf(cluster.bootstrapServers());
 
         final Properties p = new Properties();
@@ -131,8 +136,11 @@ public class RuntimeChaosTaskMigratedIntegrationTest {
         if (producer != null) {
             producer.close(Duration.ofSeconds(5));
         }
-        if (streams != null) {
-            streams.close(Duration.ofSeconds(30));
+        if (streamsA != null) {
+            streamsA.close(Duration.ofSeconds(30));
+        }
+        if (streamsB != null) {
+            streamsB.close(Duration.ofSeconds(30));
         }
         if (proxy != null) {
             proxy.close();
@@ -143,85 +151,107 @@ public class RuntimeChaosTaskMigratedIntegrationTest {
     }
 
     @Test
-    public void shouldStayExactlyOnceUnderRuntimeMigrationStorm() throws Exception {
-        startApp();
+    public void shouldStayExactlyOnceWhileCleanerDeletesOrphanedTaskDirs() throws Exception {
+        final LogCaptureAppender logs = LogCaptureAppender.createAndRegister();
+        streamsA = buildStreams(TestUtils.tempDirectory().getPath());
+        streamsB = buildStreams(TestUtils.tempDirectory().getPath());
+        streamsA.start();
+        streamsB.start();
+        waitForBothRunning(Duration.ofSeconds(60).toMillis());
         startProducer();
 
-        // Arm the runtime lever and let the app churn while continuously processing. NO restart.
         final FaultRule fence =
-            proxy.injectError(ApiKeys.END_TXN, Errors.PRODUCER_FENCED).withProbability(FAULT_PROBABILITY);
-        final LogCaptureAppender logs =
-            LogCaptureAppender.createAndRegister();
-        Thread.sleep(CHAOS_DURATION_MS);
+            proxy.injectError(ApiKeys.END_TXN, Errors.PRODUCER_FENCED).withProbability(FENCE_PROBABILITY);
+        final FaultRule hb =
+            proxy.disconnectOn(ApiKeys.HEARTBEAT).withProbability(DISCONNECT_PROBABILITY);
+        runCleanerChurn();
 
-        // Stop the storm and the producer, then let the app fully drain and quiesce.
         proxy.clearFaults();
         producing.set(false);
         producerThread.join(Duration.ofSeconds(10).toMillis());
 
-        final long migrationLogs = logs.getMessages().stream().filter(m -> {
-            final String l = m.toLowerCase(Locale.ROOT);
-            return l.contains("migrated") || l.contains("fenced") || l.contains("detected that the thread");
-        }).count();
+        final long cleanerDeletions = countLogs(logs, "deleting obsolete state directory");
+        final long migrationLogs = countMigrationLogs(logs);
+        final long restoreLogs = countRestoreLogs(logs);
         logs.close();
 
         final long total = produced.get();
-        // Oracle 2: exactly-once. Poll the store (via IQ) until the summed window counts reach the produced
-        // total, or time out. Under exactly-once this converges to EXACTLY total; > total => duplication.
         final long summed = waitForStoreSum(total);
 
-        System.out.println("CHAOS-STATS fired=" + fence.timesTriggered() + " migrationLogs=" + migrationLogs
+        System.out.println("CHAOS-STATS fired=" + fence.timesTriggered()
+            + " hbDisconnects=" + hb.timesTriggered()
+            + " cleanerDeletions=" + cleanerDeletions
+            + " migrationLogs=" + migrationLogs
+            + " restoreLogs=" + restoreLogs
             + " produced=" + total + " summed=" + summed);
 
-        // Churn sanity: the storm must have actually injected fences AND caused real migrations, otherwise a
-        // clean pass would be hollow.
         assertTrue(fence.timesTriggered() > 0,
-            "the fault storm never fired (fired=" + fence.timesTriggered() + ")");
+            "the fence storm never fired (fired=" + fence.timesTriggered() + ")");
         assertTrue(migrationLogs > 0,
             "no migration/fence churn observed in logs (count=" + migrationLogs + ")");
+        assertTrue(cleanerDeletions > 0,
+            "the state-directory cleaner never fired (cleanerDeletions=" + cleanerDeletions
+                + ") -- lever not exercised");
 
-        // Oracle 1: no fatal from a recoverable churn.
         final Throwable fatal = uncaught.get();
         if (fatal != null) {
             final String chain = throwableChain(fatal).toLowerCase(Locale.ROOT);
             if (chain.contains("committedoffset") || (chain.contains("closed") && chain.contains("segment"))) {
-                fail("KAFKA-20808-class regression under migration storm:\n" + throwableChain(fatal));
+                fail("KAFKA-20808-class regression under cleaner-race storm:\n" + throwableChain(fatal));
             }
-            fail("runtime migration storm surfaced a fatal exception:\n" + throwableChain(fatal));
+            fail("runtime cleaner-race storm surfaced a fatal exception:\n" + throwableChain(fatal));
         }
         assertEquals(total, summed,
-            "exactly-once violated under runtime migration storm: produced=" + total + " but store summed=" + summed);
-        assertEquals(KafkaStreams.State.RUNNING, streams.state(), "app should be RUNNING after the storm");
+            "exactly-once violated under cleaner-race storm: produced=" + total + " but store summed=" + summed);
+        assertTrue(streamsA.state() == KafkaStreams.State.RUNNING || streamsB.state() == KafkaStreams.State.RUNNING,
+            "at least one instance should be RUNNING after the storm");
     }
 
     // --- scaffold ---
 
-    private void startApp() throws Exception {
+    private void runCleanerChurn() throws Exception {
+        for (int i = 0; i < CHURN_CYCLES && uncaught.get() == null; i++) {
+            try {
+                final Optional<String> removed = streamsB.removeStreamThread();
+                removed.ifPresent(n -> { });
+            } catch (final Exception ignore) {
+                // shedding may race a rebalance; ignore and continue churning
+            }
+            Thread.sleep(SHED_WINDOW_MS); // orphan window: task moves to A, B's dir unlocked -> cleaner deletes it
+            try {
+                streamsB.addStreamThread();
+            } catch (final Exception ignore) {
+                // adding may race a rebalance; ignore
+            }
+            Thread.sleep(SETTLE_MS);
+        }
+    }
+
+    private KafkaStreams buildStreams(final String stateDirPath) {
         final StreamsBuilder builder = new StreamsBuilder();
-        final WindowBytesStoreSupplier supplier = Stores.persistentWindowStore(
-            STORE_NAME, Duration.ofMillis(RETENTION_MS), Duration.ofMillis(WINDOW_MS), false);
         builder.stream(inputTopic, Consumed.with(Serdes.String(), Serdes.String()))
             .groupByKey(Grouped.with(Serdes.String(), Serdes.String()))
-            .windowedBy(TimeWindows.ofSizeWithNoGrace(Duration.ofMillis(WINDOW_MS)))
-            .count(Materialized.as(supplier));
+            .count(Materialized.<String, Long>as(Stores.persistentKeyValueStore(STORE_NAME))
+                .withKeySerde(Serdes.String())
+                .withValueSerde(Serdes.Long()));
 
         final Properties props = new Properties();
         props.put(StreamsConfig.APPLICATION_ID_CONFIG, appId);
         props.put(StreamsConfig.BOOTSTRAP_SERVERS_CONFIG, proxy.bootstrapServers());
-        props.put(StreamsConfig.STATE_DIR_CONFIG, TestUtils.tempDirectory().getPath());
+        props.put(StreamsConfig.STATE_DIR_CONFIG, stateDirPath);
         props.put(StreamsConfig.PROCESSING_GUARANTEE_CONFIG, StreamsConfig.EXACTLY_ONCE_V2);
         props.put(StreamsConfig.STATESTORE_CACHE_MAX_BYTES_CONFIG, 0);
         props.put(StreamsConfig.COMMIT_INTERVAL_MS_CONFIG, 100L);
-        props.put(StreamsConfig.NUM_STREAM_THREADS_CONFIG, 2);
+        props.put(StreamsConfig.NUM_STREAM_THREADS_CONFIG, 1);
+        props.put(StreamsConfig.STATE_CLEANUP_DELAY_MS_CONFIG, CLEANUP_DELAY_MS);
         props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
 
-        streams = new KafkaStreams(builder.build(), props);
-        streams.setUncaughtExceptionHandler(t -> {
+        final KafkaStreams ks = new KafkaStreams(builder.build(), props);
+        ks.setUncaughtExceptionHandler(t -> {
             uncaught.compareAndSet(null, t);
             return StreamsUncaughtExceptionHandler.StreamThreadExceptionResponse.SHUTDOWN_CLIENT;
         });
-        streams.start();
-        waitForRunning(Duration.ofSeconds(120).toMillis());
+        return ks;
     }
 
     private void startProducer() {
@@ -246,10 +276,11 @@ public class RuntimeChaosTaskMigratedIntegrationTest {
         producerThread.start();
     }
 
-    private void waitForRunning(final long timeoutMs) throws Exception {
+    private void waitForBothRunning(final long timeoutMs) throws Exception {
         final long deadline = System.currentTimeMillis() + timeoutMs;
         while (System.currentTimeMillis() < deadline) {
-            if (streams.state() == KafkaStreams.State.RUNNING) {
+            if (streamsA.state() == KafkaStreams.State.RUNNING
+                && streamsB.state() == KafkaStreams.State.RUNNING) {
                 return;
             }
             if (uncaught.get() != null) {
@@ -257,17 +288,45 @@ public class RuntimeChaosTaskMigratedIntegrationTest {
             }
             Thread.sleep(200);
         }
-        fail("app did not reach RUNNING within " + timeoutMs + "ms (state=" + streams.state() + ")");
+        fail("apps did not both reach RUNNING within " + timeoutMs + "ms (A="
+            + streamsA.state() + ", B=" + streamsB.state() + ")");
     }
 
-    /** Sum all window counts across all keys via IQ. Retries through transient IQ unavailability during rebalances. */
+    private static long countLogs(final LogCaptureAppender logs, final String substr) {
+        return logs.getMessages().stream()
+            .filter(m -> m.toLowerCase(Locale.ROOT).contains(substr))
+            .count();
+    }
+
+    private static long countMigrationLogs(final LogCaptureAppender logs) {
+        return logs.getMessages().stream().filter(m -> {
+            final String l = m.toLowerCase(Locale.ROOT);
+            return l.contains("migrated") || l.contains("fenced") || l.contains("detected that the thread");
+        }).count();
+    }
+
+    private static long countRestoreLogs(final LogCaptureAppender logs) {
+        return logs.getMessages().stream().filter(m -> {
+            final String l = m.toLowerCase(Locale.ROOT);
+            return l.contains("restoring state") || l.contains("restoration in progress")
+                || l.contains("state directory does not exist") || l.contains("reinitializing");
+        }).count();
+    }
+
+    /** Sum all per-key counts via IQ across BOTH instances (a key lives on exactly one instance). */
     private long storeSum() {
-        final ReadOnlyWindowStore<String, Long> store = streams.store(
-            StoreQueryParameters.fromNameAndType(STORE_NAME, QueryableStoreTypes.windowStore()));
         long sum = 0;
-        try (KeyValueIterator<org.apache.kafka.streams.kstream.Windowed<String>, Long> all = store.all()) {
-            while (all.hasNext()) {
-                sum += all.next().value;
+        for (final KafkaStreams ks : new KafkaStreams[] {streamsA, streamsB}) {
+            try {
+                final ReadOnlyKeyValueStore<String, Long> store = ks.store(
+                    StoreQueryParameters.fromNameAndType(STORE_NAME, QueryableStoreTypes.<String, Long>keyValueStore()));
+                try (KeyValueIterator<String, Long> all = store.all()) {
+                    while (all.hasNext()) {
+                        sum += all.next().value;
+                    }
+                }
+            } catch (final InvalidStateStoreException skip) {
+                // this instance does not (yet) serve the store -- rebalance/revive in progress
             }
         }
         return sum;
@@ -277,13 +336,9 @@ public class RuntimeChaosTaskMigratedIntegrationTest {
         final long deadline = System.currentTimeMillis() + Duration.ofSeconds(120).toMillis();
         long last = -1;
         while (System.currentTimeMillis() < deadline) {
-            try {
-                last = storeSum();
-                if (last >= target) {
-                    return last;
-                }
-            } catch (final InvalidStateStoreException retry) {
-                // store temporarily unavailable (rebalance/revive in progress) — keep polling
+            last = storeSum();
+            if (last >= target) {
+                return last;
             }
             Thread.sleep(500);
         }
