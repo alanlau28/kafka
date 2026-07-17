@@ -224,6 +224,39 @@ public class Kip1035FaultPathIntegrationTest {
         assertEquals(KafkaStreams.State.RUNNING, streams.state(), "app should be RUNNING after recovery");
     }
 
+    @Test
+    public void shouldRecoverExactlyOnceWhenCommittedOffsetsMissingUnderEos() throws Exception {
+        // Different branch than status=OPEN: after a CLEAN close the status key is CLOSED (so openDB
+        // succeeds), but with the committed offsets deleted, ProcessorStateManager.initializeStoreOffsets
+        // sees committedOffset==null on a non-empty store under EOS -> TaskCorrupted -> wipe -> restore.
+        streams = buildAndStart();
+        produce(KEY, 5);
+        assertEquals(5L, waitForCount(KEY, 5L), "count should reach 5 before shutdown");
+        streams.close(Duration.ofSeconds(30));
+        streams = null;
+
+        final List<File> storeDirs = findStoreDirs(stateDir, STORE_NAME);
+        assertTrue(!storeDirs.isEmpty(), "expected to find at least one on-disk store dir for " + STORE_NAME);
+        for (final File dir : storeDirs) {
+            RocksDBStoreCorruptionUtils.deleteOffsets(dir);
+        }
+
+        try (final LogCaptureAppender logs = LogCaptureAppender.createAndRegister(TaskManager.class)) {
+            streams = buildAndStart();
+
+            produce(KEY, 5);
+            assertEquals(10L, waitForCount(KEY, 10L),
+                "count must be exactly-once 10 after missing-offsets recovery (restore rebuilt 5, then +5)");
+
+            assertTrue(
+                logs.getMessages().stream().anyMatch(m -> m.toLowerCase(Locale.ROOT).contains("corrupt")),
+                "missing committed offsets on a non-empty EOS store must be treated as corruption (proves recovery ran)");
+        }
+
+        assertNull(uncaught.get(), "recovery from missing committed offsets must not surface a fatal exception");
+        assertEquals(KafkaStreams.State.RUNNING, streams.state(), "app should be RUNNING after recovery");
+    }
+
     // --- helpers ---
 
     /**
