@@ -35,6 +35,7 @@ import org.apache.kafka.streams.kstream.Consumed;
 import org.apache.kafka.streams.kstream.Grouped;
 import org.apache.kafka.streams.kstream.Materialized;
 import org.apache.kafka.streams.kstream.Produced;
+import org.apache.kafka.streams.kstream.TimeWindows;
 import org.apache.kafka.streams.processor.internals.TaskManager;
 import org.apache.kafka.streams.state.internals.RocksDBStoreCorruptionUtils;
 import org.apache.kafka.test.TestUtils;
@@ -109,12 +110,29 @@ public class Kip1035FaultPathIntegrationTest {
     }
 
     private KafkaStreams buildAndStart() throws Exception {
+        return buildAndStart(false);
+    }
+
+    private KafkaStreams buildAndStart(final boolean windowed) throws Exception {
         final StreamsBuilder builder = new StreamsBuilder();
-        builder.stream(inputTopic, Consumed.with(Serdes.String(), Serdes.String()))
-            .groupByKey(Grouped.with(Serdes.String(), Serdes.String()))
-            .count(Materialized.as(STORE_NAME))
-            .toStream()
-            .to(outputTopic, Produced.with(Serdes.String(), Serdes.Long()));
+        if (windowed) {
+            // Windowed count is backed by a segmented store (AbstractRocksDBSegmentedBytesStore) — one
+            // RocksDB dir per segment. A single wide window keeps the running count for key "a" in one
+            // window so the max observed output value equals the total count.
+            builder.stream(inputTopic, Consumed.with(Serdes.String(), Serdes.String()))
+                .groupByKey(Grouped.with(Serdes.String(), Serdes.String()))
+                .windowedBy(TimeWindows.ofSizeWithNoGrace(Duration.ofHours(1)))
+                .count(Materialized.as(STORE_NAME))
+                .toStream()
+                .map((wk, v) -> KeyValue.pair(wk.key(), v))
+                .to(outputTopic, Produced.with(Serdes.String(), Serdes.Long()));
+        } else {
+            builder.stream(inputTopic, Consumed.with(Serdes.String(), Serdes.String()))
+                .groupByKey(Grouped.with(Serdes.String(), Serdes.String()))
+                .count(Materialized.as(STORE_NAME))
+                .toStream()
+                .to(outputTopic, Produced.with(Serdes.String(), Serdes.Long()));
+        }
 
         final Properties props = new Properties();
         props.put(StreamsConfig.APPLICATION_ID_CONFIG, appId);
@@ -172,14 +190,52 @@ public class Kip1035FaultPathIntegrationTest {
         assertEquals(KafkaStreams.State.RUNNING, streams.state(), "app should be RUNNING after recovery");
     }
 
+    @Test
+    public void shouldRecoverExactlyOnceFromUncleanShutdownForSegmentedStore() throws Exception {
+        // Same recovery contract as the KV case, but for a WINDOWED (segmented) store — one RocksDB dir per
+        // segment. This is where KAFKA-20808 lived: a segment inserted-before-open surviving closeDirty.
+        streams = buildAndStart(true);
+        produce(KEY, 5);
+        assertEquals(5L, waitForCount(KEY, 5L), "windowed count should reach 5 before shutdown");
+        streams.close(Duration.ofSeconds(30));
+        streams = null;
+
+        // Mark EVERY segment's KIP-1035 status key OPEN — an unclean shutdown of the segmented store.
+        final List<File> segmentDirs = findStoreDirs(stateDir, STORE_NAME);
+        assertTrue(segmentDirs.size() >= 1, "expected at least one on-disk segment dir for " + STORE_NAME
+            + " (found: " + segmentDirs + ")");
+        for (final File dir : segmentDirs) {
+            RocksDBStoreCorruptionUtils.setStoreStatusToOpen(dir);
+        }
+
+        try (final LogCaptureAppender logs = LogCaptureAppender.createAndRegister(TaskManager.class)) {
+            streams = buildAndStart(true);
+
+            produce(KEY, 5);
+            assertEquals(10L, waitForCount(KEY, 10L),
+                "windowed count must be exactly-once 10 after unclean-shutdown recovery (restore rebuilt 5, then +5)");
+
+            assertTrue(
+                logs.getMessages().stream().anyMatch(m -> m.toLowerCase(Locale.ROOT).contains("corrupt")),
+                "the injected OPEN status must be detected as a corrupted task (proves the recovery path ran)");
+        }
+
+        assertNull(uncaught.get(), "recovery from an unclean shutdown must not surface a fatal exception");
+        assertEquals(KafkaStreams.State.RUNNING, streams.state(), "app should be RUNNING after recovery");
+    }
+
     // --- helpers ---
 
-    /** Recursively find RocksDB store directories (named {@code storeName} and containing a CURRENT file). */
+    /**
+     * Recursively find RocksDB store directories for {@code storeName}, matching both the single-dir
+     * KV store ({@code counts}) and the per-segment dirs of a segmented store ({@code counts.<segmentId>}) —
+     * i.e. any directory whose name starts with {@code storeName} and contains a RocksDB {@code CURRENT} file.
+     */
     private static List<File> findStoreDirs(final File root, final String storeName) throws Exception {
         final List<File> dirs = new ArrayList<>();
         try (Stream<Path> walk = Files.walk(root.toPath())) {
             walk.filter(Files::isDirectory)
-                .filter(p -> p.getFileName().toString().equals(storeName))
+                .filter(p -> p.getFileName().toString().startsWith(storeName))
                 .filter(p -> Files.exists(p.resolve("CURRENT")))
                 .forEach(p -> dirs.add(p.toFile()));
         }
