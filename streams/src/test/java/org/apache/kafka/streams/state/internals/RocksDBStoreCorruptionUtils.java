@@ -43,9 +43,44 @@ public final class RocksDBStoreCorruptionUtils {
     private static final StringSerializer STRING_SERIALIZER = new StringSerializer();
     private static final byte[] OFFSETS_COLUMN_FAMILY_NAME = "offsets".getBytes(StandardCharsets.UTF_8);
     private static final byte[] STATUS_KEY = STRING_SERIALIZER.serialize(null, "status");
+    private static final byte[] POSITION_KEY = STRING_SERIALIZER.serialize(null, "position");
     private static final byte[] OPEN_STATE = Serdes.Long().serializer().serialize(null, 1L);
 
     private RocksDBStoreCorruptionUtils() {
+    }
+
+    /**
+     * Reads the committed changelog offsets from the store's offsets column family, keyed by the
+     * {@code TopicPartition.toString()} form used by the store. Used to capture the real offsets before
+     * simulating a pre-KIP-1035 layout (offsets in a legacy checkpoint file rather than the offsets CF).
+     *
+     * @param dbDir the RocksDB store directory
+     */
+    public static java.util.Map<String, Long> readCommittedOffsets(final File dbDir) throws RocksDBException {
+        final java.util.Map<String, Long> offsets = new java.util.HashMap<>();
+        try (final DBOptions dbOptions = new DBOptions();
+             final ColumnFamilyOptions cfOptions = new ColumnFamilyOptions()) {
+
+            final List<ColumnFamilyDescriptor> cfDescriptors = listCfDescriptors(dbDir, cfOptions);
+            final List<ColumnFamilyHandle> cfHandles = new ArrayList<>(cfDescriptors.size());
+            try (final RocksDB db = RocksDB.open(dbOptions, dbDir.getAbsolutePath(), cfDescriptors, cfHandles)) {
+                final ColumnFamilyHandle offsetsCf = findOffsetsCf(cfHandles, cfDescriptors);
+                try (final org.rocksdb.RocksIterator iter = db.newIterator(offsetsCf)) {
+                    iter.seekToFirst();
+                    while (iter.isValid()) {
+                        final byte[] key = iter.key();
+                        if (!Arrays.equals(key, STATUS_KEY) && !Arrays.equals(key, POSITION_KEY)) {
+                            offsets.put(new String(key, StandardCharsets.UTF_8),
+                                Serdes.Long().deserializer().deserialize(null, iter.value()));
+                        }
+                        iter.next();
+                    }
+                }
+            } finally {
+                cfHandles.forEach(ColumnFamilyHandle::close);
+            }
+        }
+        return offsets;
     }
 
     /**
