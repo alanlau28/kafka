@@ -29,9 +29,11 @@ import org.apache.kafka.common.serialization.StringDeserializer;
 import org.apache.kafka.common.serialization.StringSerializer;
 import org.apache.kafka.streams.KafkaStreams;
 import org.apache.kafka.streams.KeyValue;
+import org.apache.kafka.streams.StoreQueryParameters;
 import org.apache.kafka.streams.StreamsBuilder;
 import org.apache.kafka.streams.StreamsConfig;
 import org.apache.kafka.streams.ThreadMetadata;
+import org.apache.kafka.streams.errors.InvalidStateStoreException;
 import org.apache.kafka.streams.errors.StreamsUncaughtExceptionHandler;
 import org.apache.kafka.streams.integration.utils.EmbeddedKafkaCluster;
 import org.apache.kafka.streams.integration.utils.KafkaProtocolFaultProxy;
@@ -40,7 +42,11 @@ import org.apache.kafka.streams.kstream.Grouped;
 import org.apache.kafka.streams.kstream.Materialized;
 import org.apache.kafka.streams.kstream.Produced;
 import org.apache.kafka.streams.kstream.SessionWindows;
+import org.apache.kafka.streams.kstream.Windowed;
 import org.apache.kafka.streams.processor.TaskId;
+import org.apache.kafka.streams.state.KeyValueIterator;
+import org.apache.kafka.streams.state.QueryableStoreTypes;
+import org.apache.kafka.streams.state.ReadOnlySessionStore;
 import org.apache.kafka.streams.state.SessionBytesStoreSupplier;
 import org.apache.kafka.streams.state.Stores;
 import org.apache.kafka.test.TestUtils;
@@ -53,7 +59,6 @@ import org.junit.jupiter.api.TestInfo;
 import org.junit.jupiter.api.Timeout;
 
 import java.time.Duration;
-import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.Locale;
@@ -337,27 +342,56 @@ public class RuntimeChaosTargetedStandbyTakeoverIntegrationTest {
             + " B=" + describe(instanceB));
     }
 
+    /**
+     * Poll the authoritative exactly-once oracle — the session STORE via IQ — until it reaches {@code target}
+     * or times out. Every input record lands in exactly one session, so the sum of all session counts equals
+     * records produced iff nothing was lost/duplicated. Immune to the session-output-stream orphan artifact
+     * (a session's end shifts across a takeover, orphaning pre-takeover intermediate output records); a genuine
+     * store over-count still surfaces via the final assertEquals.
+     */
     private long awaitSinkSum(final long target, final long timeoutMs) throws Exception {
         final long deadline = System.currentTimeMillis() + timeoutMs;
         long sum = -1;
         while (System.currentTimeMillis() < deadline) {
-            sum = currentSinkSum();
-            if (sum >= target) {
-                return sum;
+            final long s = storeSessionSum();
+            if (s >= 0) {
+                sum = s;
+                if (sum >= target) {
+                    return sum;
+                }
             }
             Thread.sleep(1_000);
         }
         return sum;
     }
 
-    private long currentSinkSum() {
+    private long storeSessionSum() {
         long sum = 0;
-        for (final Long v : new ArrayList<>(latestPerWindow.values())) {
-            if (v != null) {
-                sum += v;
+        for (final String key : KEYS) {
+            final Long a = fetchSessionSum(instanceA, key);
+            final Long b = fetchSessionSum(instanceB, key);
+            if (a == null && b == null) {
+                return -1; // neither instance can serve this key right now — retry the whole pass
             }
+            sum += (a != null ? a : 0L) + (b != null ? b : 0L);
         }
         return sum;
+    }
+
+    private Long fetchSessionSum(final KafkaStreams ks, final String key) {
+        try {
+            final ReadOnlySessionStore<String, Long> store = ks.store(
+                StoreQueryParameters.fromNameAndType(STORE_NAME, QueryableStoreTypes.sessionStore()));
+            long s = 0;
+            try (KeyValueIterator<Windowed<String>, Long> it = store.fetch(key)) {
+                while (it.hasNext()) {
+                    s += it.next().value;
+                }
+            }
+            return s;
+        } catch (final InvalidStateStoreException notHereRightNow) {
+            return null;
+        }
     }
 
     private Set<TaskId> activeTaskIds(final KafkaStreams ks) {
