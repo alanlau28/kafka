@@ -55,7 +55,7 @@ import static org.apache.kafka.streams.state.internals.Utils.rawPlainValue;
  *   <li>Read: {@code [value]} → {@code [headers][timestamp][value]} (add empty headers and timestamp=-1)</li>
  * </ul>
  */
-public class PlainToHeadersWindowStoreAdapter implements WindowStore<Bytes, byte[]> {
+public class PlainToHeadersWindowStoreAdapter implements WindowStore<Bytes, byte[]>, WithRetentionPeriod {
     private final WindowStore<Bytes, byte[]> store;
 
     public PlainToHeadersWindowStoreAdapter(final WindowStore<Bytes, byte[]> store) {
@@ -66,6 +66,30 @@ public class PlainToHeadersWindowStoreAdapter implements WindowStore<Bytes, byte
             throw new IllegalArgumentException("Provided store must be a plain (non-timestamped) window store, but it is timestamped.");
         }
         this.store = store;
+    }
+
+    /**
+     * Report the retention of the store being adapted.
+     *
+     * <p>Without this, the adapter is a dead end for
+     * {@code ProcessorStateManager.StateStoreMetadata.extractRetentionPeriod}, which
+     * locates retention by walking {@link WrappedStateStore#wrapped()} to the
+     * innermost layer. This adapter deliberately holds its delegate in a private
+     * field rather than as a {@code WrappedStateStore}, so that walk terminates here
+     * and resolves -1. The KAFKA-13499 windowed-restore optimisation is gated on
+     * {@code retentionPeriod > 0 && retentionPeriod != Long.MAX_VALUE}, so a -1
+     * silently disables it for every store behind this adapter -- notably
+     * stream-stream join stores -- with no logging above {@code debug}.
+     */
+    @Override
+    public long retentionPeriod() {
+        StateStore current = store;
+        while (current instanceof WrappedStateStore) {
+            current = ((WrappedStateStore<?, ?, ?>) current).wrapped();
+        }
+        return current instanceof WithRetentionPeriod
+            ? ((WithRetentionPeriod) current).retentionPeriod()
+            : -1L;
     }
 
     @Override
