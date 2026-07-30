@@ -207,6 +207,95 @@ public class StoreChangelogReader implements ChangelogReader {
     /** Bound on the backward probe for the newest data record (1,2,4 ... 512 offsets). */
     private static final int PROBE_MAX_ATTEMPTS = 10;
 
+    /**
+     * Walk backwards from each partition's end offset until a real data record materialises, so
+     * its timestamp can drive the retention-based seek. Under EOS the last offset is usually a
+     * transaction control record, which occupies an offset but is never delivered to a consumer,
+     * so a single probe at {@code endOffset - 1} comes back empty.
+     *
+     * <p>Each partition walks its own ladder: the poll is shared, and it returns whichever
+     * fetch lands first, so a partition can go unresolved for reasons that have nothing to do
+     * with its own offset. A single global step-back would punish those partitions with an
+     * ever-staler head timestamp.
+     *
+     * @return the number of probe attempts used
+     */
+    private int runBackwardProbe(final Set<TopicPartition> unresolved,
+                                 final Map<TopicPartition, Long> backByPartition,
+                                 final Map<TopicPartition, Long> probeOffset,
+                                 final Map<TopicPartition, Long> latestTimestamps,
+                                 final Map<TopicPartition, Long> beginningOffsets,
+                                 final Map<TopicPartition, Long> endOffsets) {
+        int attempts = 0;
+        for (int attempt = 0; attempt < PROBE_MAX_ATTEMPTS && !unresolved.isEmpty(); attempt++) {
+            attempts++;
+            for (final TopicPartition partition : unresolved) {
+                final long begin = beginningOffsets.getOrDefault(partition, 0L);
+                final long target =
+                    Math.max(begin, endOffsets.get(partition) - backByPartition.get(partition));
+                restoreConsumer.seek(partition, target);
+            }
+
+            final ConsumerRecords<byte[], byte[]> probed = restoreConsumer.poll(pollTime);
+
+            final Iterator<TopicPartition> iterator = unresolved.iterator();
+            while (iterator.hasNext()) {
+                final TopicPartition partition = iterator.next();
+                final List<ConsumerRecord<byte[], byte[]>> records = probed.records(partition);
+                if (!records.isEmpty()) {
+                    // the LAST record in the batch is the newest one seen
+                    final ConsumerRecord<byte[], byte[]> newest = records.get(records.size() - 1);
+                    latestTimestamps.put(partition, newest.timestamp());
+                    probeOffset.put(partition, newest.offset());
+                    iterator.remove();
+                } else if (endOffsets.get(partition) - backByPartition.get(partition)
+                               <= beginningOffsets.getOrDefault(partition, 0L)) {
+                    // already probed the whole log; nothing more to find
+                    iterator.remove();
+                } else {
+                    backByPartition.put(partition, backByPartition.get(partition) * 2L);
+                }
+            }
+        }
+        return attempts;
+    }
+
+    /** SOAK INSTRUMENTATION (not for upstream): how far into the retained log a seek landed. */
+    private static String pctThroughLog(final long position, final long begin, final long end) {
+        return end > begin ? String.format("%.1f", 100.0 * (position - begin) / (end - begin)) : "n/a";
+    }
+
+    /**
+     * SOAK INSTRUMENTATION (not for upstream). Grep OOORE-SEEK for the number that actually
+     * decides whether a restore gets lapped: where it was positioned, and how much margin that
+     * leaves against a log-start that keeps advancing.
+     */
+    private void logSeekOutcomes(final Map<TopicPartition, Long> windowedPartitionsRetention,
+                                 final Map<TopicPartition, Long> beginningOffsets,
+                                 final Map<TopicPartition, Long> endOffsets,
+                                 final Set<TopicPartition> seekToBeginningPartitions,
+                                 final Map<TopicPartition, Long> probeOffset,
+                                 final Map<TopicPartition, Long> backByPartition) {
+        for (final Map.Entry<TopicPartition, Long> entry : windowedPartitionsRetention.entrySet()) {
+            final TopicPartition partition = entry.getKey();
+            final long begin = beginningOffsets.getOrDefault(partition, 0L);
+            final long end = endOffsets.get(partition);
+            if (seekToBeginningPartitions.contains(partition)) {
+                log.info("OOORE-SEEK partition={} outcome=FALLBACK_TO_BEGINNING begin={} end={} "
+                        + "marginRecords=0 retentionMs={}", partition, begin, end, entry.getValue());
+                continue;
+            }
+            final long position = restoreConsumer.position(partition);
+            log.info("OOORE-SEEK partition={} outcome=OPTIMISED seekedTo={} begin={} end={} "
+                    + "marginRecords={} behindHead={} pctThroughLog={} probeOffset={} "
+                    + "backUsed={} retentionMs={}",
+                partition, position, begin, end,
+                position - begin, end - position,
+                pctThroughLog(position, begin, end),
+                probeOffset.get(partition), backByPartition.get(partition), entry.getValue());
+        }
+    }
+
     private final Duration pollTime;
     private final long updateOffsetIntervalMs;
 
@@ -1093,33 +1182,18 @@ public class StoreChangelogReader implements ChangelogReader {
                 // SOAK INSTRUMENTATION (not for upstream): profile the windowed seek path.
                 final int probeTargets = unresolved.size();
                 final long probeStartNs = System.nanoTime();
-                int probeAttempts = 0;
-                long back = 1L;
-                for (int attempt = 0; attempt < PROBE_MAX_ATTEMPTS && !unresolved.isEmpty(); attempt++) {
-                    probeAttempts++;
-                    for (final TopicPartition partition : unresolved) {
-                        final long begin = beginningOffsets.getOrDefault(partition, 0L);
-                        final long target = Math.max(begin, endOffsets.get(partition) - back);
-                        restoreConsumer.seek(partition, target);
-                    }
-
-                    final ConsumerRecords<byte[], byte[]> probed = restoreConsumer.poll(pollTime);
-
-                    final Iterator<TopicPartition> iterator = unresolved.iterator();
-                    while (iterator.hasNext()) {
-                        final TopicPartition partition = iterator.next();
-                        final List<ConsumerRecord<byte[], byte[]>> records = probed.records(partition);
-                        if (!records.isEmpty()) {
-                            // the LAST record in the batch is the newest one seen
-                            latestTimestamps.put(partition, records.get(records.size() - 1).timestamp());
-                            iterator.remove();
-                        } else if (endOffsets.get(partition) - back <= beginningOffsets.getOrDefault(partition, 0L)) {
-                            // already probed the whole log; nothing more to find
-                            iterator.remove();
-                        }
-                    }
-                    back *= 2;
+                final int probeAttempts;
+                // Per-partition step-back. A shared poll returns whichever partition's fetch
+                // lands first, so a partition can go unresolved for reasons unrelated to its
+                // own offset. Doubling one global `back` punished those partitions with an
+                // ever-staler head timestamp; each partition now walks its own ladder.
+                final Map<TopicPartition, Long> backByPartition = new HashMap<>();
+                final Map<TopicPartition, Long> probeOffset = new HashMap<>();
+                for (final TopicPartition partition : unresolved) {
+                    backByPartition.put(partition, 1L);
                 }
+                probeAttempts = runBackwardProbe(unresolved, backByPartition, probeOffset,
+                    latestTimestamps, beginningOffsets, endOffsets);
 
                 final long probeMs = (System.nanoTime() - probeStartNs) / 1_000_000L;
                 final int fallbacksBefore = seekToBeginningPartitions.size();
@@ -1136,6 +1210,11 @@ public class StoreChangelogReader implements ChangelogReader {
                     probeTargets, probeAttempts, latestTimestamps.size(),
                     seekToBeginningPartitions.size() - fallbacksBefore,
                     probeMs, seekMs, probeMs + seekMs);
+                // SOAK INSTRUMENTATION (not for upstream). Grep OOORE-SEEK for the number that
+                // actually decides whether we get lapped: where the restore was positioned, and
+                // how much margin that leaves against a log-start that keeps advancing.
+                logSeekOutcomes(windowedPartitionsRetention, beginningOffsets, endOffsets,
+                    seekToBeginningPartitions, probeOffset, backByPartition);
             } catch (final TimeoutException e) {
                 log.debug("Could not seek by timestamp for changelog partitions {}, falling back to seek-to-beginning",
                     windowedPartitionsRetention.keySet(), e);
