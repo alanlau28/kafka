@@ -51,7 +51,6 @@ import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
-import java.util.Iterator;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -208,6 +207,18 @@ public class StoreChangelogReader implements ChangelogReader {
     private static final int PROBE_MAX_ATTEMPTS = 10;
 
     /**
+     * How far back from the end offset the head-timestamp probe starts.
+     *
+     * <p>Not 1. Under exactly-once the last offset is nearly always a transaction control record,
+     * which occupies an offset but is never delivered to a consumer: across 195 measured probes on
+     * a soak, {@code endOffset - 1} returned a record exactly zero times, so starting there buys a
+     * guaranteed empty poll costing the full {@code poll.ms}. Starting further back costs nothing
+     * in accuracy, because the probe takes the NEWEST record of the returned batch -- measured, the
+     * resolved record sat 6-14 offsets behind the end even when the probe seeked 64-256 back.
+     */
+    private static final long PROBE_INITIAL_BACK = 32L;
+
+    /**
      * Walk backwards from each partition's end offset until a real data record materialises, so
      * its timestamp can drive the retention-based seek. Under EOS the last offset is usually a
      * transaction control record, which occupies an offset but is never delivered to a consumer,
@@ -227,36 +238,46 @@ public class StoreChangelogReader implements ChangelogReader {
                                  final Map<TopicPartition, Long> beginningOffsets,
                                  final Map<TopicPartition, Long> endOffsets) {
         int attempts = 0;
-        for (int attempt = 0; attempt < PROBE_MAX_ATTEMPTS && !unresolved.isEmpty(); attempt++) {
-            attempts++;
-            for (final TopicPartition partition : unresolved) {
-                final long begin = beginningOffsets.getOrDefault(partition, 0L);
-                final long target =
-                    Math.max(begin, endOffsets.get(partition) - backByPartition.get(partition));
+        final Set<TopicPartition> probing = new HashSet<>(unresolved);
+        for (final TopicPartition partition : probing) {
+            // One partition at a time. With a shared poll, poll() returns as soon as ANY fetch
+            // lands, so a partition can come back empty for reasons that have nothing to do with
+            // its own offset -- and then its step-back is doubled on that false evidence, and the
+            // shared attempt budget is spent on its behalf. Measured on the soak: attempts=10,
+            // resolved=4 of 5, the starved partition falling back to log-start with zero margin
+            // and being lapped 67s later; it then resolved on the next try at backUsed=2.
+            // Probing alone makes "empty" mean "no record at this offset", which is what the
+            // step-back logic assumes, and gives every partition its own budget.
+            restoreConsumer.pause(restoreConsumer.assignment());
+            restoreConsumer.resume(Collections.singleton(partition));
+            final long begin = beginningOffsets.getOrDefault(partition, 0L);
+
+            for (int attempt = 0; attempt < PROBE_MAX_ATTEMPTS; attempt++) {
+                attempts++;
+                final long back = backByPartition.get(partition);
+                final long target = Math.max(begin, endOffsets.get(partition) - back);
                 restoreConsumer.seek(partition, target);
-            }
 
-            final ConsumerRecords<byte[], byte[]> probed = restoreConsumer.poll(pollTime);
-
-            final Iterator<TopicPartition> iterator = unresolved.iterator();
-            while (iterator.hasNext()) {
-                final TopicPartition partition = iterator.next();
+                final ConsumerRecords<byte[], byte[]> probed = restoreConsumer.poll(pollTime);
                 final List<ConsumerRecord<byte[], byte[]>> records = probed.records(partition);
                 if (!records.isEmpty()) {
                     // the LAST record in the batch is the newest one seen
                     final ConsumerRecord<byte[], byte[]> newest = records.get(records.size() - 1);
                     latestTimestamps.put(partition, newest.timestamp());
                     probeOffset.put(partition, newest.offset());
-                    iterator.remove();
-                } else if (endOffsets.get(partition) - backByPartition.get(partition)
-                               <= beginningOffsets.getOrDefault(partition, 0L)) {
-                    // already probed the whole log; nothing more to find
-                    iterator.remove();
-                } else {
-                    backByPartition.put(partition, backByPartition.get(partition) * 2L);
+                    unresolved.remove(partition);
+                    break;
                 }
+                if (target <= begin) {
+                    // probed the whole log; nothing more to find
+                    unresolved.remove(partition);
+                    break;
+                }
+                backByPartition.put(partition, back * 2L);
             }
         }
+        // Restore the pause state the caller set up before the probe.
+        restoreConsumer.resume(probing);
         return attempts;
     }
 
@@ -1190,7 +1211,7 @@ public class StoreChangelogReader implements ChangelogReader {
                 final Map<TopicPartition, Long> backByPartition = new HashMap<>();
                 final Map<TopicPartition, Long> probeOffset = new HashMap<>();
                 for (final TopicPartition partition : unresolved) {
-                    backByPartition.put(partition, 1L);
+                    backByPartition.put(partition, PROBE_INITIAL_BACK);
                 }
                 probeAttempts = runBackwardProbe(unresolved, backByPartition, probeOffset,
                     latestTimestamps, beginningOffsets, endOffsets);
