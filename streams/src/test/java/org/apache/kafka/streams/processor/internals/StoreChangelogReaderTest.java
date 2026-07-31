@@ -1436,21 +1436,11 @@ public class StoreChangelogReaderTest {
     }
 
     /**
-     * The backward probe shares ONE poll across every unresolved windowed partition, and
-     * {@code PROBE_MAX_ATTEMPTS} is a single global budget spent by that shared loop. A real poll
-     * returns as soon as any fetch lands, so partitions resolve a few at a time -- meaning that
-     * with more windowed partitions than attempts, some structurally CANNOT be served, and fall
-     * back to a log-start seek with zero margin against a delete-retention changelog.
-     *
-     * <p>Observed on the soak (2026-07-31 03:18) with only 5 partitions:
-     * {@code targets=5 attempts=10 resolved=4 newFallbacks=1}, then
-     * {@code Fetch position 44617352 is out of range} 67 seconds later. That same partition
-     * resolved on the next attempt with {@code backUsed=2}, so its own offset was never the
-     * problem -- it simply never got served inside the budget.
-     *
-     * <p>Here the MockConsumer delivers one partition per poll, which is the shared poll's real
-     * behaviour made deterministic. Every partition has a finite retention against a log far
-     * longer than it, so a log-start seek for ANY of them is the defect.
+     * A shared probe poll returns as soon as any fetch lands, so partitions resolve a few at a
+     * time; with the attempt budget shared too, more partitions than attempts means some cannot be
+     * served at all and fall back to a log-start seek with zero margin. Here the MockConsumer
+     * delivers one partition per poll, and every partition's retention is far shorter than its log,
+     * so a log-start seek for any of them is the defect.
      */
     @Test
     public void shouldNotStarveWindowedPartitionsIntoALogStartSeekWhenTheyOutnumberProbeAttempts() {

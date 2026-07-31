@@ -69,17 +69,10 @@ public class PlainToHeadersWindowStoreAdapter implements WindowStore<Bytes, byte
     }
 
     /**
-     * Report the retention of the store being adapted.
-     *
-     * <p>Without this, the adapter is a dead end for
-     * {@code ProcessorStateManager.StateStoreMetadata.extractRetentionPeriod}, which
-     * locates retention by walking {@link WrappedStateStore#wrapped()} to the
-     * innermost layer. This adapter deliberately holds its delegate in a private
-     * field rather than as a {@code WrappedStateStore}, so that walk terminates here
-     * and resolves -1. The KAFKA-13499 windowed-restore optimisation is gated on
-     * {@code retentionPeriod > 0 && retentionPeriod != Long.MAX_VALUE}, so a -1
-     * silently disables it for every store behind this adapter -- notably
-     * stream-stream join stores -- with no logging above {@code debug}.
+     * Report the retention of the store being adapted. This adapter holds its delegate in a private
+     * field rather than as a {@link WrappedStateStore}, so {@code extractRetentionPeriod}'s unwrap
+     * walk terminates here; without this it resolves -1 and the KAFKA-13499 windowed-restore
+     * optimisation is silently skipped for every store behind the adapter.
      */
     @Override
     public long retentionPeriod() {

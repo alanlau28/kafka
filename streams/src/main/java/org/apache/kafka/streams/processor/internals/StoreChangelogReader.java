@@ -203,33 +203,19 @@ public class StoreChangelogReader implements ChangelogReader {
 
     private final Time time;
     private final Logger log;
-    /** Bound on the backward probe for the newest data record (1,2,4 ... 512 offsets). */
+    /** Bound on the backward probe for the newest data record, per partition. */
     private static final int PROBE_MAX_ATTEMPTS = 10;
 
-    /**
-     * How far back from the end offset the head-timestamp probe starts.
-     *
-     * <p>Not 1. Under exactly-once the last offset is nearly always a transaction control record,
-     * which occupies an offset but is never delivered to a consumer: across 195 measured probes on
-     * a soak, {@code endOffset - 1} returned a record exactly zero times, so starting there buys a
-     * guaranteed empty poll costing the full {@code poll.ms}. Starting further back costs nothing
-     * in accuracy, because the probe takes the NEWEST record of the returned batch -- measured, the
-     * resolved record sat 6-14 offsets behind the end even when the probe seeked 64-256 back.
-     */
+    // not 1: under EOS the last offset is nearly always a transaction control record, which is
+    // never delivered to a consumer, so probing there is a guaranteed empty poll. Starting further
+    // back is free, since the probe takes the newest record of the returned batch
     private static final long PROBE_INITIAL_BACK = 32L;
 
     /**
-     * Walk backwards from each partition's end offset until a real data record materialises, so
-     * its timestamp can drive the retention-based seek. Under EOS the last offset is usually a
-     * transaction control record, which occupies an offset but is never delivered to a consumer,
-     * so a single probe at {@code endOffset - 1} comes back empty.
+     * Walk backwards from each partition's end offset until a data record materialises, so its
+     * timestamp can drive the retention-based seek.
      *
-     * <p>Each partition walks its own ladder: the poll is shared, and it returns whichever
-     * fetch lands first, so a partition can go unresolved for reasons that have nothing to do
-     * with its own offset. A single global step-back would punish those partitions with an
-     * ever-staler head timestamp.
-     *
-     * @return the number of probe attempts used
+     * @return the number of polls issued
      */
     private int runBackwardProbe(final Set<TopicPartition> unresolved,
                                  final Map<TopicPartition, Long> backByPartition,
@@ -240,14 +226,9 @@ public class StoreChangelogReader implements ChangelogReader {
         int attempts = 0;
         final Set<TopicPartition> probing = new HashSet<>(unresolved);
         for (final TopicPartition partition : probing) {
-            // One partition at a time. With a shared poll, poll() returns as soon as ANY fetch
-            // lands, so a partition can come back empty for reasons that have nothing to do with
-            // its own offset -- and then its step-back is doubled on that false evidence, and the
-            // shared attempt budget is spent on its behalf. Measured on the soak: attempts=10,
-            // resolved=4 of 5, the starved partition falling back to log-start with zero margin
-            // and being lapped 67s later; it then resolved on the next try at backUsed=2.
-            // Probing alone makes "empty" mean "no record at this offset", which is what the
-            // step-back logic assumes, and gives every partition its own budget.
+            // one partition at a time: with a shared poll an empty result may only mean another
+            // partition's fetch landed first, which would double this one's step-back on false
+            // evidence and spend the shared attempt budget on its behalf
             restoreConsumer.pause(restoreConsumer.assignment());
             restoreConsumer.resume(Collections.singleton(partition));
             final long begin = beginningOffsets.getOrDefault(partition, 0L);
@@ -286,11 +267,7 @@ public class StoreChangelogReader implements ChangelogReader {
         return end > begin ? String.format("%.1f", 100.0 * (position - begin) / (end - begin)) : "n/a";
     }
 
-    /**
-     * SOAK INSTRUMENTATION (not for upstream). Grep OOORE-SEEK for the number that actually
-     * decides whether a restore gets lapped: where it was positioned, and how much margin that
-     * leaves against a log-start that keeps advancing.
-     */
+    /** SOAK INSTRUMENTATION (not for upstream): where each restore was seeked to, and its margin. */
     private void logSeekOutcomes(final Map<TopicPartition, Long> windowedPartitionsRetention,
                                  final Map<TopicPartition, Long> beginningOffsets,
                                  final Map<TopicPartition, Long> endOffsets,
@@ -1185,29 +1162,17 @@ public class StoreChangelogReader implements ChangelogReader {
                 }
                 windowedPartitionsRetention.keySet().removeAll(seekToBeginningPartitions);
 
-                // Probe backwards from the head for the newest DATA record.
-                //
-                // Seeking once to endOffset-1 is not enough: under exactly-once the
-                // tail of a changelog is very often a TRANSACTION CONTROL RECORD,
-                // which occupies an offset but is never returned to any consumer, at
-                // any isolation level. A single probe there comes back empty, and the
-                // whole optimisation silently degrades to seekToBeginning -- which is
-                // zero margin against a delete-retention changelog and is exactly how
-                // the restore then gets lapped. Measured on a soak: 100 and 150
-                // partitions took that fallback, and the optimisation fired 0 times.
-                //
-                // So step back 1, 2, 4, 8 ... offsets until a record materialises,
-                // bounded by the log's beginning and by PROBE_MAX_ATTEMPTS.
+                // probe backwards from the head for the newest data record: a single probe at
+                // endOffset-1 is not enough, since under EOS that offset is usually a transaction
+                // control record, which is never returned to a consumer at any isolation level,
+                // and the optimisation would then silently degrade to seekToBeginning
                 final Map<TopicPartition, Long> latestTimestamps = new HashMap<>();
                 final Set<TopicPartition> unresolved = new HashSet<>(windowedPartitionsRetention.keySet());
-                // SOAK INSTRUMENTATION (not for upstream): profile the windowed seek path.
+                // SOAK INSTRUMENTATION (not for upstream): profile the windowed seek path
                 final int probeTargets = unresolved.size();
                 final long probeStartNs = System.nanoTime();
                 final int probeAttempts;
-                // Per-partition step-back. A shared poll returns whichever partition's fetch
-                // lands first, so a partition can go unresolved for reasons unrelated to its
-                // own offset. Doubling one global `back` punished those partitions with an
-                // ever-staler head timestamp; each partition now walks its own ladder.
+                // each partition walks its own step-back ladder
                 final Map<TopicPartition, Long> backByPartition = new HashMap<>();
                 final Map<TopicPartition, Long> probeOffset = new HashMap<>();
                 for (final TopicPartition partition : unresolved) {
@@ -1221,19 +1186,13 @@ public class StoreChangelogReader implements ChangelogReader {
                 final long seekStartNs = System.nanoTime();
                 seekByRetentionFromPolledRecords(latestTimestamps, windowedPartitionsRetention, seekToBeginningPartitions);
                 final long seekMs = (System.nanoTime() - seekStartNs) / 1_000_000L;
-                // SOAK INSTRUMENTATION (not for upstream). Grep OOORE-PROBE to profile:
-                //   probeMs  = backward probe for the head timestamp (attempts x poll.ms)
-                //   seekMs   = offsetsForTimes round trip plus the seeks it drives
-                //   resolved = partitions whose head timestamp was found
-                //   newFallbacks = partitions that still ended up at log-start
+                // SOAK INSTRUMENTATION (not for upstream): probeMs is the head-timestamp probe,
+                // seekMs the offsetsForTimes round trip, newFallbacks those still at log-start
                 log.info("OOORE-PROBE targets={} attempts={} resolved={} newFallbacks={} "
                         + "probeMs={} seekMs={} totalMs={}",
                     probeTargets, probeAttempts, latestTimestamps.size(),
                     seekToBeginningPartitions.size() - fallbacksBefore,
                     probeMs, seekMs, probeMs + seekMs);
-                // SOAK INSTRUMENTATION (not for upstream). Grep OOORE-SEEK for the number that
-                // actually decides whether we get lapped: where the restore was positioned, and
-                // how much margin that leaves against a log-start that keeps advancing.
                 logSeekOutcomes(windowedPartitionsRetention, beginningOffsets, endOffsets,
                     seekToBeginningPartitions, probeOffset, backByPartition);
             } catch (final TimeoutException e) {
