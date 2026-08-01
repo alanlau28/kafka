@@ -225,6 +225,14 @@ public class StoreChangelogReader implements ChangelogReader {
                                  final Map<TopicPartition, Long> endOffsets) {
         int attempts = 0;
         final Set<TopicPartition> probing = new HashSet<>(unresolved);
+        // every probed partition needs a position before the first poll: poll() updates fetch
+        // positions for the whole assignment, not just the resumed partition, and the restore
+        // consumer has auto.offset.reset=none
+        for (final TopicPartition partition : probing) {
+            final long begin = beginningOffsets.getOrDefault(partition, 0L);
+            restoreConsumer.seek(partition,
+                Math.max(begin, endOffsets.get(partition) - backByPartition.get(partition)));
+        }
         for (final TopicPartition partition : probing) {
             // one partition at a time: with a shared poll an empty result may only mean another
             // partition's fetch landed first, which would double this one's step-back on false
