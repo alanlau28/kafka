@@ -173,6 +173,8 @@ public class ProducerMetadata extends Metadata {
     public synchronized void update(int requestVersion, MetadataResponse response, boolean isPartialUpdate, long nowMs) {
         super.update(requestVersion, response, isPartialUpdate, nowMs);
         errors = response.errors();
+        // Fatal errors are failures to fetch metadata, so a successful response means they are stale
+        clearFatalError();
 
         // Remove all topics in the response that are in the new topic set. Note that if an error was encountered for a
         // new topic's metadata, then any work to resolve the error will include the topic in a full metadata update.

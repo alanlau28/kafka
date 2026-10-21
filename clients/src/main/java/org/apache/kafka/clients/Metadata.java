@@ -688,6 +688,13 @@ public class Metadata implements Closeable {
     }
 
     /**
+     * Clear a fatal error recorded by {@link #fatalError(KafkaException)} that has not been thrown yet.
+     */
+    protected synchronized void clearFatalError() {
+        this.fatalException = null;
+    }
+
+    /**
      * Record a permanent bootstrap DNS resolution failure. Unlike {@link #fatalError},
      * this exception is never cleared after being thrown, so all subsequent API calls
      * will see it (bootstrap failure is not recoverable without recreating the client).

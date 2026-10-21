@@ -20,11 +20,13 @@ import org.apache.kafka.clients.CommonClientConfigs;
 import org.apache.kafka.common.KafkaException;
 import org.apache.kafka.common.errors.AuthenticationException;
 import org.apache.kafka.common.errors.TimeoutException;
+import org.apache.kafka.common.errors.UnsupportedVersionException;
 import org.apache.kafka.common.internals.ClusterResourceListeners;
 import org.apache.kafka.common.requests.MetadataResponse;
 import org.apache.kafka.common.requests.RequestTestUtils;
 import org.apache.kafka.common.utils.Time;
 import org.apache.kafka.common.utils.internals.LogContext;
+import org.apache.kafka.test.TestUtils;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -38,6 +40,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -199,6 +202,55 @@ public class ProducerMetadataTest {
         time += METADATA_IDLE_MS * 2;
         metadata.updateWithCurrentRequestVersion(responseWithCurrentTopics(), false, time);
         assertTrue(metadata.containsTopic(topic3), "Topic expired while awaiting metadata");
+    }
+
+    @Test
+    public void testAuthenticationErrorClearedBySuccessfulUpdate() {
+        assertFatalErrorClearedBySuccessfulUpdate(new AuthenticationException("Fatal exception from test"));
+    }
+
+    @Test
+    public void testUnsupportedVersionClearedBySuccessfulUpdate() {
+        assertFatalErrorClearedBySuccessfulUpdate(new UnsupportedVersionException("Fatal exception from test"));
+    }
+
+    private void assertFatalErrorClearedBySuccessfulUpdate(KafkaException exception) {
+        long time = 0;
+        metadata.add("my-topic", time);
+        metadata.fatalError(exception);
+        metadata.updateWithCurrentRequestVersion(responseWithCurrentTopics(), false, time);
+
+        metadata.add("new-topic", time);
+        assertThrows(TimeoutException.class,
+            () -> metadata.awaitUpdate(metadata.requestUpdateForTopic("new-topic"), Time.SYSTEM.timer(0)));
+    }
+
+    @Test
+    public void testFatalErrorAfterSuccessfulUpdateIsThrown() {
+        long time = 0;
+        metadata.add("my-topic", time);
+        metadata.updateWithCurrentRequestVersion(responseWithCurrentTopics(), false, time);
+        AuthenticationException exception = new AuthenticationException("Fatal exception from test");
+        metadata.fatalError(exception);
+
+        metadata.add("new-topic", time);
+        AuthenticationException thrown = assertThrows(AuthenticationException.class,
+            () -> metadata.awaitUpdate(metadata.requestUpdateForTopic("new-topic"), Time.SYSTEM.timer(1000)));
+        assertSame(exception, thrown);
+    }
+
+    @Test
+    public void testMetadataWaitAbortedOnFatalExceptionDuringWait() throws Exception {
+        String topic = "my-topic";
+        metadata.add(topic, 0);
+        Thread t1 = asyncFetch(topic, 30_000);
+        TestUtils.waitForCondition(() -> t1.getState() == Thread.State.TIMED_WAITING, "Awaiting update");
+
+        AuthenticationException exception = new AuthenticationException("Fatal exception from test");
+        metadata.fatalError(exception);
+        t1.join();
+        assertSame(exception, backgroundError.get());
+        clearBackgroundError();
     }
 
     @Test
