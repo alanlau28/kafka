@@ -92,7 +92,12 @@ public class DefaultApiVersionManagerTest {
         );
 
         for (ApiKeys apiKey : ApiKeys.apisForListener(apiScope)) {
-            if (apiKey.messageType.latestVersionUnstable()) {
+            if (apiKey == ApiKeys.API_VERSIONS) {
+                // Every ApiVersions version is enabled, so that the server can answer a newer client's request
+                // and the client can fall back (KIP-511, see ApiKeys.isVersionEnabled). This fails once ApiVersions
+                // has no unstable version, and then the special case can be removed.
+                assertTrue(apiKey.messageType.latestVersionUnstable());
+            } else if (apiKey.messageType.latestVersionUnstable()) {
                 assertFalse(
                     versionManager.isApiEnabled(apiKey, apiKey.latestVersion()),
                     apiKey + " version " + apiKey.latestVersion() + " should be disabled."
